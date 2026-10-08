@@ -425,7 +425,7 @@ python .\main.py
 当前仓库已加入基础回归测试，可运行：
 
 ```bash
-python -m unittest -v test.py test_diagnostics.py
+python -m unittest -v test.py test_diagnostics.py test_browser_checkin.py
 ```
 
 这些测试会禁用真实 HTTP 请求，并使用固定的模拟验证结果，
@@ -486,6 +486,13 @@ gh workflow run cordcloud.yml --repo yeahjack/cordcloud-checkin --ref fix/login-
 需要查看静态协议调用形态时，可额外显式设置 `inspect_scripts=true`。
 它解析 inline 代码并最多 GET 页面引用的 6 个同源公共 `.js`（不带 query、无账号/Cookie、无重定向），不会执行 JavaScript 或请求验证码接口。
 输出只保留固定语法/协议字段/已知端点，其余字符串、数字和标识符全部替换。未知外部脚本不会抓取。
+
+### 标准浏览器与当前 CAP 组件
+
+站点当前页面加载 `cap.min.js`，通过组件 `solve` 事件取得 token；旧 ALTCHA-only 请求程序没有执行这一正常前端流程。
+手动 workflow 的 `browser_mode` 可选 `inspect`、`login`、`checkin`，默认 `off`。使用官方固定版 Playwright 1.63.0 和匹配 Chromium，临时会话，无反检测、代理、持久化 Cookie、trace 或截图。
+`inspect` 不接收账号 Secrets；`login`/`checkin` 只使用现有 CC_EMAIL/CC_PASSWD，等待站点自己的 CAP 组件完成后点击原登录控件一次。设备二次验证出现时停止，不发送 OTP 或修改账号设置。
+只有实际签到响应或已签到状态才算目标完成；CI 绿色本身不能证明签到。遇到 HTTP 403/429 停止，不改路线重试。
 
 ## 声明
 

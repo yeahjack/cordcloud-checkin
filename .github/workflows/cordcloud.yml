@@ -20,6 +20,15 @@ on:
         type: boolean
         required: false
         default: false
+      browser_mode:
+        description: "Standard Chromium with the site's CAP widget (off/inspect/login/checkin)"
+        type: choice
+        options:
+          - 'off'
+          - inspect
+          - login
+          - checkin
+        default: 'off'
 
 jobs:
   checkin:
@@ -36,15 +45,39 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v6
+        if: github.event_name == 'workflow_dispatch' && inputs.browser_mode != 'off'
+        with:
+          python-version: '3.13'
+      - name: Install official Playwright and Chromium
+        if: github.event_name == 'workflow_dispatch' && inputs.browser_mode != 'off'
+        timeout-minutes: 8
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-browser.txt
+          python -m playwright install --with-deps chromium
+      - name: Inspect normal CAP component without credentials
+        if: github.event_name == 'workflow_dispatch' && inputs.browser_mode == 'inspect'
+        timeout-minutes: 4
+        env:
+          BROWSER_MODE: inspect
+        run: python browser_checkin.py
+      - name: Use normal CAP login and optional check-in
+        if: github.event_name == 'workflow_dispatch' && (inputs.browser_mode == 'login' || inputs.browser_mode == 'checkin')
+        timeout-minutes: 5
+        env:
+          BROWSER_MODE: ${{ inputs.browser_mode }}
+          INPUT_EMAIL: ${{ secrets.CC_EMAIL }}
+          INPUT_PASSWD: ${{ secrets.CC_PASSWD }}
+        run: python browser_checkin.py
       - name: Read login page structure without credentials
-        if: github.event_name == 'workflow_dispatch' && inputs.page_only
+        if: github.event_name == 'workflow_dispatch' && inputs.page_only && inputs.browser_mode == 'off'
         uses: ./
         with:
           page_only: true
           inspect_scripts: ${{ inputs.inspect_scripts }}
           host: cordcloud.one
       - name: Run check-in or login diagnostics
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.page_only) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.page_only || inputs.browser_mode != 'off')) }}
         uses: ./
         with:
           diagnostics: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostics || false }}
