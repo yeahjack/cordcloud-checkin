@@ -28,6 +28,10 @@ inputs:
     description: "credential-free GET of the login page; no redirects, login or challenge solving"
     required: false
     default: "false"
+  inspect_scripts:
+    description: "page_only: statically inspect inline and up to six same-origin public JS files; never execute JS"
+    required: false
+    default: "false"
   trust_device:
     description: "trust the current device after successful 2FA (default: false)"
     required: false

@@ -85,7 +85,9 @@ def maybe_run_page_only():
         host = (core.get_input('host') or '').strip()
         if not host or ',' in host:
             raise RuntimeError('需要一个明确的 host')
-        Action('', '', host=host, page_only=True, diagnostic_logger=log.info).inspect_login_page()
+        inspect_scripts = (core.get_input('inspect_scripts') or '').strip().lower() == 'true'
+        Action('', '', host=host, page_only=True, inspect_scripts=inspect_scripts,
+               diagnostic_logger=log.info).inspect_login_page()
         log.info('只读页面诊断已结束；未发送账号、登录表单、验证码或通知')
     except Exception:
         log.set_failed('只读页面诊断已停止；请查看固定阶段记录，未输出原始错误内容')

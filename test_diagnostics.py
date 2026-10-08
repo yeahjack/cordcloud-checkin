@@ -367,9 +367,9 @@ class PageOnlyTests(unittest.TestCase):
     def test_page_mode_entrypoint_never_reads_account_or_config(self):
         core, log = mock.Mock(), mock.Mock()
         def get_input(name):
-            if name not in {'page_only', 'host'}:
+            if name not in {'page_only', 'host', 'inspect_scripts'}:
                 raise AssertionError('account or other input must not be read')
-            return {'page_only': 'true', 'host': 'cordcloud.one'}[name]
+            return {'page_only': 'true', 'host': 'cordcloud.one', 'inspect_scripts': 'false'}[name]
         core.get_input.side_effect = get_input
         toolkit = types.ModuleType('actions_toolkit')
         toolkit.core = core
@@ -384,7 +384,8 @@ class PageOnlyTests(unittest.TestCase):
         self.assertEqual(exit_code.exception.code, 0)
         config.assert_not_called()
         notifier.assert_not_called()
-        constructor.assert_called_once_with('', '', host='cordcloud.one', page_only=True, diagnostic_logger=log.info)
+        constructor.assert_called_once_with('', '', host='cordcloud.one', page_only=True, inspect_scripts=False,
+                                            diagnostic_logger=log.info)
         action.inspect_login_page.assert_called_once()
         action.login.assert_not_called()
         action.check_in.assert_not_called()
@@ -398,6 +399,78 @@ class PageOnlyTests(unittest.TestCase):
         for credential in ('email:', 'passwd:', 'secret:', 'code:', 'telegram_'):
             self.assertNotIn(credential, page_step)
         self.assertIn('page_only: true', page_step)
+
+
+class StaticProtocolTests(unittest.TestCase):
+    def test_normalized_code_redacts_all_values_and_unknown_identifiers(self):
+        from app.protocol_inspection import protocol_windows
+        source = '''// private-comment
+        const privateIdentifier = 'private-secret'; const stamp = 123456789;
+        const altcha = await fetch('/auth/altcha/challenge?token=private-token');
+        const payload = {email: 'private-email', passwd: 'private-password', csrf_token: 'private-csrf',
+          number: 123456, signature: 'private-signature', salt: 'private-salt'};
+        fetch('/auth/login', {method:'POST', body: JSON.stringify(payload)});'''
+        windows = protocol_windows(source)
+        output = ' '.join(windows)
+        self.assertTrue(windows)
+        self.assertNotIn('private', output)
+        self.assertNotIn('123456', output)
+        self.assertIn('/auth/altcha/challenge?<query>', output)
+        self.assertIn('/auth/login', output)
+        self.assertIn('csrf_token', output)
+        self.assertIn("'POST'", output)
+
+    def test_no_execution_and_template_values_are_redacted(self):
+        from app.protocol_inspection import protocol_windows
+        output = ' '.join(protocol_windows('const altcha = `private-${dangerous()}`; privateFunction(999999);'))
+        self.assertNotIn('dangerous', output)
+        self.assertNotIn('private', output)
+        self.assertNotIn('999999', output)
+        self.assertIn('altcha', output)
+
+    def test_only_observed_same_origin_js_are_selected_and_queries_removed(self):
+        from app.protocol_inspection import script_sources
+        html = '''<script>window.altcha;</script><script src="/assets/login.js?token=private-token"></script>
+        <script src="https://attacker.invalid/steal.js"></script><script src="/auth/altcha/challenge"></script>
+        <script src="/private%2Ftoken.js"></script><script src="https://user:pass@cordcloud.one/code.js"></script>'''
+        inline, urls = script_sources(html, 'https://cordcloud.one/auth/login')
+        self.assertIn('window.altcha;', inline)
+        self.assertEqual(urls, ['https://cordcloud.one/assets/login.js'])
+
+    def test_static_source_reads_are_bounded(self):
+        from app.protocol_inspection import script_sources
+        html = ''.join(f'<script src="/assets/file{i}.js"></script>' for i in range(20))
+        _, urls = script_sources(html, 'https://cordcloud.one/auth/login')
+        self.assertEqual(len(urls), 6)
+
+    def test_opt_in_reads_static_js_without_post_or_challenge_requests(self):
+        url, js_url = 'https://cordcloud.one/auth/login', 'https://cordcloud.one/assets/login.js'
+        session = FakeSession({
+            ('GET', url): [FakeResponse(url, text='<form></form><script src="/assets/login.js?private=token"></script>')],
+            ('GET', js_url): [FakeResponse(js_url, text="const altcha = fetch('/auth/altcha/challenge');")],
+        })
+        logs = []
+        action = Action('', '', host='cordcloud.one', page_only=True, inspect_scripts=True,
+                        session=session, diagnostic_logger=logs.append)
+        with mock.patch('requests.sessions.Session.request', side_effect=AssertionError('real HTTP forbidden')), \
+             mock.patch.object(action, '_solve_altcha') as solver:
+            action.inspect_login_page()
+        solver.assert_not_called()
+        self.assertEqual([(m, u) for m, u, _ in session.calls], [('GET', url), ('GET', js_url)])
+        self.assertNotIn('private', '\n'.join(logs))
+        self.assertTrue(any('protocol_static_js' in line for line in logs))
+
+    def test_static_js_denial_stops_following_resources(self):
+        url, js_url = 'https://cordcloud.one/auth/login', 'https://cordcloud.one/assets/first.js'
+        session = FakeSession({
+            ('GET', url): [FakeResponse(url, text='<script src="/assets/first.js"></script><script src="/assets/next.js"></script>')],
+            ('GET', js_url): [FakeResponse(js_url, status_code=403)],
+        })
+        action = Action('', '', host='cordcloud.one', page_only=True, inspect_scripts=True,
+                        session=session, diagnostic_logger=lambda _: None)
+        with self.assertRaises(RequestSafetyError):
+            action.inspect_login_page()
+        self.assertEqual(len(session.calls), 2)
 
 
 if __name__ == '__main__':

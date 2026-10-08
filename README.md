@@ -483,6 +483,10 @@ gh workflow run cordcloud.yml --repo yeahjack/cordcloud-checkin --ref fix/login-
 gh workflow run cordcloud.yml --repo yeahjack/cordcloud-checkin --ref fix/login-protocol-safety -f page_only=true -f diagnostics=false
 ```
 
+需要查看静态协议调用形态时，可额外显式设置 `inspect_scripts=true`。
+它解析 inline 代码并最多 GET 页面引用的 6 个同源公共 `.js`（不带 query、无账号/Cookie、无重定向），不会执行 JavaScript 或请求验证码接口。
+输出只保留固定语法/协议字段/已知端点，其余字符串、数字和标识符全部替换。未知外部脚本不会抓取。
+
 ## 声明
 
 请不要把真实账号、密码、`secret`、邮件验证码直接提交到仓库。

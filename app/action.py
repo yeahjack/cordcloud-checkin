@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from app.diagnostics import content_type_category, describe_challenge, describe_form, describe_page, emit
+from app.protocol_inspection import protocol_windows, script_sources
 
 import requests
 from requests import exceptions as request_exceptions
@@ -59,6 +60,7 @@ class Action:
         diagnostics: bool = False,
         diagnostic_logger=None,
         page_only: bool = False,
+        inspect_scripts: bool = False,
     ):
         if page_only and any((email, passwd, secret, code)):
             raise RequestSafetyError('只读页面诊断不接受账号或凭据')
@@ -84,6 +86,8 @@ class Action:
         self.device_fingerprint = '' if page_only else (device_fingerprint or self._build_device_fingerprint())
         self.diagnostics = diagnostics or page_only
         self.page_only = page_only
+        self.inspect_scripts = inspect_scripts
+        self._page_read_paths = {'/auth/login'}
         self.diagnostic_logger = diagnostic_logger or print
         self.session.headers.update({
             'User-Agent': (
@@ -139,8 +143,8 @@ class Action:
         url = self._same_origin_url(path)
         if self.page_only:
             target = urlparse(url)
-            if method != 'GET' or target.path != '/auth/login' or target.query or data:
-                raise RequestSafetyError('只读页面诊断仅允许 GET /auth/login，不携带请求数据')
+            if method != 'GET' or target.path not in self._page_read_paths or target.query or data:
+                raise RequestSafetyError('只读诊断仅允许已批准的 GET 路径，不携带请求数据')
             if not self.verify_tls:
                 raise RequestSafetyError('只读页面诊断必须保持 TLS 校验')
         if referer:
@@ -469,6 +473,25 @@ class Action:
             raise RetryableError(f'页面请求失败（HTTP {page.status_code}）')
         metadata = describe_page(page.text, page.url)
         self._diagnose('page_structure', **metadata)
+        if self.inspect_scripts:
+            inline, sources = script_sources(page.text, page.url)
+            for index, source in enumerate(inline):
+                windows = protocol_windows(source)
+                if windows:
+                    self._diagnose('protocol_inline', source_index=index, normalized_windows=windows)
+            for index, url in enumerate(sources):
+                self._page_read_paths.add(urlparse(url).path)
+                if hasattr(self.session, 'cookies'):
+                    self.session.cookies.clear()
+                script = self._get(url, stage='static_js_get')
+                content_type = script.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+                if (script.status_code != 200 or len(script.text) > 200000 or content_type not in
+                        {'', 'text/plain', 'text/javascript', 'application/javascript', 'application/x-javascript'}):
+                    self._diagnose('static_js_skipped', source_index=index, reason='status_size_or_type')
+                    continue
+                windows = protocol_windows(script.text)
+                if windows:
+                    self._diagnose('protocol_static_js', source_index=index, normalized_windows=windows)
         return metadata
 
     def check_in(self) -> dict:
