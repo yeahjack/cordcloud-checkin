@@ -58,16 +58,30 @@ class Guard:
         self.credential_phase = False
         self.login_posts = 0
         self.checkin_posts = 0
+        self.block_records = set()
+
+    def block(self, route, reason):
+        request = route.request
+        parsed = urlparse(request.url)
+        public_origin = f'{parsed.scheme}://{parsed.hostname}' if parsed.scheme in {'http', 'https'} else 'opaque'
+        method = request.method if request.method in {'GET', 'POST', 'HEAD', 'OPTIONS'} else 'other'
+        resource = request.resource_type if request.resource_type in {'document', 'script', 'fetch', 'xhr', 'other'} else 'other'
+        key = (reason, public_origin, method, resource)
+        if key not in self.block_records and len(self.block_records) < 20:
+            emit('route_blocked', reason=reason, public_origin=public_origin, method=method, resource=resource)
+            self.block_records.add(key)
+        route.abort()
 
     def route(self, route):
         request = route.request
         parsed = urlparse(request.url)
         same = origin(request.url) == origin(self.base)
         if self.denied or parsed.scheme not in {'https', 'data', 'blob', 'about'}:
-            route.abort()
+            self.block(route, 'denied_or_unsafe_scheme')
             return
         if not same and (request.is_navigation_request() or self.credential_phase or request.method not in {'GET', 'HEAD'}):
-            route.abort()
+            self.block(route, 'credential_phase_external' if self.credential_phase else (
+                'cross_origin_navigation' if request.is_navigation_request() else 'cross_origin_write'))
             return
         if same and request.method == 'POST' and parsed.path == '/auth/login':
             self.login_posts += 1
@@ -91,10 +105,26 @@ class Guard:
         if response.status in {403, 429}:
             self.denied = True
             emit('access_restricted', http_status=response.status)
-        if path in {'/auth/login', '/user/checkin'} or '/cap/' in path or path.endswith('.wasm'):
+        if path in {'/auth/login', '/user/checkin'} or 'cap' in path or path.endswith('.wasm') or response.request.resource_type in {'xhr', 'fetch'}:
             kind = 'login' if path == '/auth/login' else ('checkin' if path == '/user/checkin' else 'captcha_asset_or_api')
             emit('network', kind=kind, http_status=response.status,
                  method=response.request.method if response.request.method in {'GET', 'POST'} else 'other')
+        try:
+            if 'json' in response.headers.get('content-type', '') and response.request.resource_type in {'xhr', 'fetch'}:
+                result = response.json()
+                if isinstance(result, dict):
+                    known = {'instr_automated_browser', 'automated_browser_detected', 'network_error',
+                             'challenge_parse_error', 'challenge_unsupported', 'solve_failed', 'instr_timeout',
+                             'instr_blocked', 'redeem_failed', 'invalid_solution', 'invalid_expires',
+                             'wasm_load_failed', 'worker_spawn_failed'}
+                    codes = sorted({value for key in ('reason', 'error', 'code')
+                                    if isinstance((value := result.get(key)), str) and value in known})
+                    if codes:
+                        emit('captcha_api_error', codes=codes)
+                    if any(code in {'instr_automated_browser', 'automated_browser_detected'} for code in codes):
+                        self.denied = True
+        except Exception:
+            pass
 
     def ensure_allowed(self):
         if self.denied:
@@ -104,9 +134,31 @@ class Guard:
 CAP_READY_JS = """() => {
   const widgets = Array.from(document.querySelectorAll('cap-widget'));
   const input = document.querySelector('input[name="cap-token"]');
-  return widgets.some(w => typeof w.token === 'string' && w.token.length > 0)
-    || Boolean(input && input.value);
+  return widgets.some(w => Boolean(w.token || w.tokenValue))
+    || Boolean(input && input.value) || Boolean(window.__ccCapProbe && window.__ccCapProbe.solved);
 }"""
+
+CAP_PROBE_JS = """(() => {
+  const known = new Set(['missing_endpoint','network_error','challenge_parse_error','challenge_unsupported',
+    'solve_failed','instr_timeout','instr_blocked','redeem_failed','invalid_solution','invalid_expires',
+    'wasm_load_failed','worker_spawn_failed','unknown']);
+  window.__ccCapProbe = {solved:false, error:'none'};
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('cap-widget').forEach(w => {
+      w.addEventListener('solve', e => { window.__ccCapProbe.solved = Boolean(e.detail && e.detail.token); });
+      w.addEventListener('error', e => {
+        const code = e.detail && e.detail.code;
+        window.__ccCapProbe.error = known.has(code) ? code : 'unknown';
+      });
+    });
+  });
+})();"""
+
+CAP_ENDPOINTS_JS = """() => Array.from(document.querySelectorAll('cap-widget')).map(w => {
+  try { const url = new URL(w.getAttribute('data-cap-api-endpoint') || '', location.href);
+    return {public_origin:url.origin, same_origin:url.origin===location.origin};
+  } catch (_) { return {public_origin:'invalid', same_origin:false}; }
+})"""
 
 
 def wait_cap(page, guard):
@@ -117,6 +169,14 @@ def wait_cap(page, guard):
         if page.evaluate(CAP_READY_JS):
             emit('captcha', provider='cap', ready=True)
             return
+        state = page.evaluate('() => window.__ccCapProbe || {solved:false,error:"none"}')
+        if isinstance(state, dict) and state.get('error') not in {None, 'none'}:
+            code = state['error']
+            known = {'missing_endpoint', 'network_error', 'challenge_parse_error', 'challenge_unsupported',
+                     'solve_failed', 'instr_timeout', 'instr_blocked', 'redeem_failed', 'invalid_solution',
+                     'invalid_expires', 'wasm_load_failed', 'worker_spawn_failed', 'unknown'}
+            emit('captcha_error', code=code if code in known else 'unknown')
+            raise FlowStop('cap_component_error')
         page.wait_for_timeout(1000)
     emit('captcha', provider='cap', ready=False)
     raise FlowStop('cap_not_ready')
@@ -142,6 +202,9 @@ def run_browser(page, guard, mode):
         raise FlowStop('login_page_unavailable')
     page.locator('#login-form').wait_for(state='visible', timeout=15000)
     emit('page', login_form=True, cap_widgets=page.locator('cap-widget').count())
+    endpoints = page.evaluate(CAP_ENDPOINTS_JS)
+    if isinstance(endpoints, list):
+        emit('captcha_endpoint', origins=endpoints)
     wait_cap(page, guard)
     if mode == 'inspect':
         emit('complete', outcome='browser_inspection_only')
@@ -194,6 +257,7 @@ def main():
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             context = browser.new_context()
+            context.add_init_script(CAP_PROBE_JS)
             guard = Guard(base)
             context.route('**/*', guard.route)
             context.on('response', guard.response)

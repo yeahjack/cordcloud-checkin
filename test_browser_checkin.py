@@ -103,6 +103,26 @@ class BrowserFlowTests(unittest.TestCase):
         flow.wait_cap(page, flow.Guard('https://cordcloud.one'))
         self.assertNotIn('.solve(', page.evaluate.call_args.args[0])
         self.assertEqual(self.messages[-1], {'stage': 'captcha', 'provider': 'cap', 'ready': True})
+        self.assertIn('tokenValue', page.evaluate.call_args.args[0])
+
+    def test_cap_error_stops_without_raw_message_or_retries(self):
+        page = mock.Mock()
+        page.evaluate.side_effect = [False, {'solved': False, 'error': 'worker_spawn_failed'}]
+        with self.assertRaisesRegex(flow.FlowStop, '^cap_component_error$'):
+            flow.wait_cap(page, flow.Guard('https://cordcloud.one'))
+        page.wait_for_timeout.assert_not_called()
+        self.assertEqual(self.messages[-1], {'stage': 'captcha_error', 'code': 'worker_spawn_failed'})
+
+    def test_explicit_automation_rejection_stops_without_exposing_token(self):
+        guard = flow.Guard('https://cordcloud.one')
+        response = mock.Mock(url=guard.base + '/auth/cap/redeem?token=private-token', status=200)
+        response.request.method, response.request.resource_type = 'POST', 'fetch'
+        response.headers = {'content-type': 'application/json'}
+        response.json.return_value = {'reason': 'instr_automated_browser', 'token': 'private-token'}
+        guard.response(response)
+        self.assertTrue(guard.denied)
+        self.assertIn({'stage': 'captcha_api_error', 'codes': ['instr_automated_browser']}, self.messages)
+        self.assertNotIn('private', json.dumps(self.messages))
 
     def test_browser_has_no_stealth_proxy_or_persistent_profile(self):
         from pathlib import Path
