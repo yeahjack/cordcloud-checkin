@@ -14,6 +14,36 @@ class FlowStop(RuntimeError):
     pass
 
 
+CAP_SERVICE_ORIGIN = ('https', 'cj.skssugetcc.org', 443)
+
+
+def is_cap_post(request):
+    """The login page explicitly configures this CAP service; no account data."""
+    try:
+        parsed = urlparse(request.url)
+        if (origin(request.url) != CAP_SERVICE_ORIGIN or request.method != 'POST'
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or request.redirected_from):
+            return False
+        parts = parsed.path.strip('/').split('/')
+        if not (1 <= len(parts) <= 3 and parts[-1] in {'challenge', 'redeem'}
+                and all(re.fullmatch(r'[A-Za-z0-9_-]{1,128}', part) for part in parts)):
+            return False
+        if request.headers.get('authorization'):
+            return False
+        payload = json.loads(request.post_data) if request.post_data else {}
+        def contains_account_data(value):
+            if isinstance(value, dict):
+                return any(str(key).lower() in {'email', 'passwd', 'password', 'secret', 'authorization', 'cookie'}
+                           or contains_account_data(item) for key, item in value.items())
+            if isinstance(value, list):
+                return any(contains_account_data(item) for item in value)
+            return False
+        return isinstance(payload, dict) and not contains_account_data(payload)
+    except (ValueError, TypeError):
+        return False
+
+
 def emit(stage, **fields):
     print('[browser] ' + json.dumps({'stage': stage, **fields}, sort_keys=True), flush=True)
 
@@ -76,10 +106,18 @@ class Guard:
         request = route.request
         parsed = urlparse(request.url)
         same = origin(request.url) == origin(self.base)
+        previous = request.redirected_from
+        if previous and origin(previous.url) == CAP_SERVICE_ORIGIN:
+            self.block(route, 'captcha_redirect')
+            return
         if self.denied or parsed.scheme not in {'https', 'data', 'blob', 'about'}:
             self.block(route, 'denied_or_unsafe_scheme')
             return
         if not same and (request.is_navigation_request() or self.credential_phase or request.method not in {'GET', 'HEAD'}):
+            if (not self.credential_phase and not request.is_navigation_request()
+                    and is_cap_post(request)):
+                route.continue_()
+                return
             self.block(route, 'credential_phase_external' if self.credential_phase else (
                 'cross_origin_navigation' if request.is_navigation_request() else 'cross_origin_write'))
             return
@@ -99,7 +137,7 @@ class Guard:
         route.continue_()
 
     def response(self, response):
-        if origin(response.url) != origin(self.base):
+        if origin(response.url) not in {origin(self.base), CAP_SERVICE_ORIGIN}:
             return
         path = urlparse(response.url).path
         if response.status in {403, 429}:

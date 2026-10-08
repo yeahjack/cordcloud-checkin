@@ -16,6 +16,9 @@ class BrowserFlowTests(unittest.TestCase):
     def route(self, url, method='GET'):
         route = mock.Mock()
         route.request.url, route.request.method = url, method
+        route.request.redirected_from = None
+        route.request.headers = {}
+        route.request.post_data = '{}'
         route.request.is_navigation_request.return_value = False
         return route
 
@@ -56,6 +59,43 @@ class BrowserFlowTests(unittest.TestCase):
         otp = self.route(guard.base + '/auth/login/2fa/verify', 'POST')
         guard.route(otp)
         otp.abort.assert_called_once()
+
+    def test_exact_cap_post_allowed_only_before_credentials(self):
+        guard = flow.Guard('https://cordcloud.one')
+        for suffix in ('challenge', 'redeem'):
+            route = self.route('https://cj.skssugetcc.org/public-site-key/' + suffix, 'POST')
+            guard.route(route)
+            route.continue_.assert_called_once()
+            guard.credential_phase = True
+            blocked = self.route(route.request.url, 'POST')
+            guard.route(blocked)
+            blocked.abort.assert_called_once()
+            guard.credential_phase = False
+
+    def test_cap_allowlist_rejects_other_origins_paths_and_credentials(self):
+        targets = ['https://analytics.google.com/challenge', 'http://cj.skssugetcc.org/challenge',
+                   'https://cj.skssugetcc.org:444/challenge', 'https://user:pass@cj.skssugetcc.org/challenge',
+                   'https://cj.skssugetcc.org/admin', 'https://cj.skssugetcc.org/challenge?token=private']
+        for url in targets:
+            self.assertFalse(flow.is_cap_post(self.route(url, 'POST').request))
+        request = self.route('https://cj.skssugetcc.org/key/redeem', 'POST').request
+        request.post_data = '{"payload":{"email":"private-email"}}'
+        self.assertFalse(flow.is_cap_post(request))
+
+    def test_cap_redirect_is_never_followed(self):
+        guard = flow.Guard('https://cordcloud.one')
+        route = self.route('https://cj.skssugetcc.org/key/challenge', 'GET')
+        route.request.redirected_from = mock.Mock(url='https://cj.skssugetcc.org/key/challenge')
+        guard.route(route)
+        route.abort.assert_called_once()
+
+    def test_cap_service_403_is_a_hard_stop(self):
+        guard = flow.Guard('https://cordcloud.one')
+        response = mock.Mock(url='https://cj.skssugetcc.org/key/challenge', status=403)
+        response.request.method, response.request.resource_type = 'POST', 'fetch'
+        response.headers = {}
+        guard.response(response)
+        self.assertTrue(guard.denied)
 
     def test_access_denial_stops_all_further_requests(self):
         guard = flow.Guard('https://cordcloud.one')
