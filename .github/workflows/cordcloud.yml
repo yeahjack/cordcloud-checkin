@@ -4,12 +4,19 @@ on:
   schedule:
     - cron: "20 2 * * *"
   workflow_dispatch:
+    inputs:
+      diagnostics:
+        description: "Login diagnostics only (no 2FA, check-in or notifications)"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
     steps:
       - name: Random Delay
+        if: github.event_name == 'schedule'
         shell: bash
         run: |
           delay=$(( RANDOM % 600 ))
@@ -19,10 +26,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./
         with:
+          diagnostics: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostics || false }}
           email: ${{ secrets.CC_EMAIL }}
           passwd: ${{ secrets.CC_PASSWD }}
           secret: ${{ secrets.CC_SECRET }}
-          verify_method: ga
+          # Auto-select only a method for which credentials are available.
+          # A device/email challenge still needs a fresh one-time code.
+          verify_method: auto
           host: cordcloud.one
           trust_device: false
           telegram_bot_token: ${{ secrets.TG_BOT_TOKEN }}

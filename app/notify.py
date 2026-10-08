@@ -40,15 +40,17 @@ class TelegramNotifier:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            raise NotifyError(f'Telegram 网络请求失败：{exc}') from exc
+            raise NotifyError('Telegram 网络请求失败；已省略包含机器人凭据的请求地址') from exc
 
         try:
             result = response.json()
         except ValueError as exc:
-            snippet = (response.text or '').strip()[:160]
             raise NotifyError(
-                f'Telegram 未返回 JSON（HTTP {response.status_code}）：{snippet}'
+                f'Telegram 未返回 JSON（HTTP {response.status_code}）；已省略响应正文'
             ) from exc
+
+        if not isinstance(result, dict):
+            raise NotifyError('Telegram 返回了非对象 JSON')
 
         if response.status_code >= 400 or not result.get('ok'):
             description = result.get('description') or f'HTTP {response.status_code}'

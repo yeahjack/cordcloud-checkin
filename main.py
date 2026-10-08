@@ -78,9 +78,11 @@ def safe_notify(notifier: TelegramNotifier | None, message: str):
 
 notifier = None
 last_host = ''
+diagnostic_mode = False
 
 try:
     config = load_config()
+    diagnostic_mode = get_bool_value('diagnostics', config, default=False)
 
     # 获取输入
     email = get_value('email', config, required=True)
@@ -91,31 +93,38 @@ try:
     host = get_value('host', config, default='cordcloud.us,cordcloud.one,cordcloud.biz,c-cloud.xyz')
     trust_device = get_bool_value('trust_device', config, default=False)
     insecure_skip_verify = get_bool_value('insecure_skip_verify', config, default=False)
-    device_fingerprint = get_or_create_device_fingerprint(config)
+    device_fingerprint = (config.get('device_fingerprint', '') if diagnostic_mode
+                          else get_or_create_device_fingerprint(config))
     telegram_bot_token = get_value('telegram_bot_token', config)
     telegram_chat_id = get_value('telegram_chat_id', config)
-    notifier = TelegramNotifier(
-        bot_token=telegram_bot_token,
-        chat_id=telegram_chat_id,
-    )
+    if not diagnostic_mode:
+        notifier = TelegramNotifier(
+            bot_token=telegram_bot_token,
+            chat_id=telegram_chat_id,
+        )
 
     mask_secret(passwd)
     mask_secret(secret)
     mask_secret(code)
     mask_secret(telegram_bot_token)
     mask_secret(telegram_chat_id)
+    if diagnostic_mode and insecure_skip_verify:
+        raise RuntimeError('诊断模式必须保持 TLS 证书校验')
     if insecure_skip_verify:
         log.warning('已启用 insecure_skip_verify；这会跳过 TLS 证书校验，仅建议在调试环境中临时使用')
 
     # host 预处理：切分、过滤空值
     hosts = [h for h in host.split(',') if h]
+    if diagnostic_mode and len(hosts) != 1:
+        raise RuntimeError('诊断模式只允许一个明确的 host，不自动切换域名')
     last_error = ''
     success = False
 
     for i, h in enumerate(hosts):
         # 依次尝试每个 host
         last_host = h
-        log.info(f'当前尝试 host：{h}')
+        if not diagnostic_mode:
+            log.info(f'当前尝试 host：{h}')
         action = Action(
             email,
             passwd,
@@ -126,10 +135,18 @@ try:
             trust_device=trust_device,
             verify_tls=not insecure_skip_verify,
             device_fingerprint=device_fingerprint,
+            diagnostics=diagnostic_mode,
+            diagnostic_logger=log.info,
         )
         try:
             # 登录
             res = action.login()
+            if diagnostic_mode:
+                if res.get('ret') not in (1, 2):
+                    raise AuthError('登录诊断被站点拒绝；请查看固定分类诊断记录')
+                log.info('登录诊断已结束；未执行设备二验、签到、流量查询或通知')
+                success = True
+                break
             msg = res.get('msg', '未知错误')
             log.info(f'尝试帐号登录，结果：{msg}')
             if res.get('ret') != 1:
@@ -167,19 +184,20 @@ try:
             success = True
             break
         except AuthError as e:
-            last_error = str(e) or last_error
+            last_error = '登录诊断已停止；请查看阶段和固定分类记录' if diagnostic_mode else (str(e) or last_error)
             log.warning(f'CordCloud Action 运行异常，错误信息：{last_error}')
             break
         except RetryableError as e:
-            last_error = str(e) or last_error
+            last_error = '登录诊断发生请求或响应错误；未重试' if diagnostic_mode else (str(e) or last_error)
             log.warning(f'CordCloud Action 运行异常，错误信息：{last_error}')
         except Exception as e:
-            last_error = str(e) or last_error
+            last_error = '登录诊断发生内部错误；已省略原始错误内容，未重试' if diagnostic_mode else (str(e) or last_error)
             log.warning(f'CordCloud Action 运行异常，错误信息：{last_error}')
 
     if not success:
         safe_notify(notifier, build_failure_message(last_host, last_error))
         log.set_failed(last_error or 'CordCloud Action 运行失败！')
 except Exception as e:
-    safe_notify(notifier, build_failure_message(last_host, str(e)))
-    log.set_failed(str(e))
+    error = '诊断已停止；请检查配置和阶段记录，未输出原始错误内容' if diagnostic_mode else str(e)
+    safe_notify(notifier, build_failure_message(last_host, error))
+    log.set_failed(error)

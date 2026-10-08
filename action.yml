@@ -20,6 +20,10 @@ inputs:
   verify_method:
     description: "preferred 2FA method: ga or email (default: auto)"
     required: false
+  diagnostics:
+    description: "value-free, single-host login diagnostics only; no 2FA/check-in/notifications"
+    required: false
+    default: "false"
   trust_device:
     description: "trust the current device after successful 2FA (default: false)"
     required: false

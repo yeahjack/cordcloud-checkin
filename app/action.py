@@ -3,8 +3,11 @@ import hashlib
 import json
 import re
 import secrets
+from html import unescape
 from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
+
+from app.diagnostics import content_type_category, describe_challenge, describe_form, emit
 
 import requests
 from requests import exceptions as request_exceptions
@@ -21,6 +24,14 @@ class ActionError(RuntimeError):
 
 class AuthError(ActionError):
     pass
+
+
+class VerificationError(AuthError):
+    """The login form's verification failed before device 2FA was reached."""
+
+
+class RequestSafetyError(AuthError):
+    """Do not retry another host after an access restriction or unsafe URL."""
 
 
 class RetryableError(ActionError):
@@ -45,6 +56,8 @@ class Action:
         trust_device: bool = False,
         verify_tls: bool = True,
         device_fingerprint: str = '',
+        diagnostics: bool = False,
+        diagnostic_logger=None,
     ):
         self.email = email
         self.passwd = passwd
@@ -57,6 +70,8 @@ class Action:
         self.trust_device = trust_device
         self.verify_tls = verify_tls
         self.device_fingerprint = device_fingerprint or self._build_device_fingerprint()
+        self.diagnostics = diagnostics
+        self.diagnostic_logger = diagnostic_logger or print
         self.session.headers.update({
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -73,6 +88,28 @@ class Action:
     def _build_device_fingerprint(self) -> str:
         return secrets.token_hex(16)
 
+    def _diagnose(self, stage: str, **metadata):
+        if self.diagnostics:
+            emit(self.diagnostic_logger, stage, **metadata)
+
+    def _same_origin_url(self, path: str, base: str = '') -> str:
+        try:
+            url = urljoin(base or self.format_url(''), str(path))
+            parsed, expected = urlparse(url), urlparse(self.format_url(''))
+            valid = (
+                parsed.scheme == expected.scheme == 'https'
+                and parsed.hostname == expected.hostname
+                and (parsed.port or 443) == (expected.port or 443)
+                and not parsed.username and not parsed.password
+                and not expected.username and not expected.password
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            self._diagnose('request_blocked', reason='unsafe_origin')
+            raise RequestSafetyError('已阻止跨域或非 HTTPS 请求；未发送该请求')
+        return url
+
     def _build_headers(self, referer: str = '', xhr: bool = False) -> Dict[str, str]:
         headers = {
             'Referer': referer or self.format_url('auth/login'),
@@ -85,43 +122,54 @@ class Action:
             })
         return headers
 
-    def _get(self, path: str, referer: str = ''):
-        url = path if path.startswith('http') else self.format_url(path)
+    def _request(self, method: str, path: str, data=None, referer: str = '', stage: str = 'request'):
+        url = self._same_origin_url(path)
+        if referer:
+            self._same_origin_url(referer)
         try:
-            return self.session.get(
-                url,
-                timeout=self.timeout,
-                verify=self.verify_tls,
-                headers=self._build_headers(referer=referer),
-            )
+            # Requests must not automatically forward credentials on a 307/308
+            # redirect. Resolve and validate every hop before sending it.
+            for redirects in range(6):
+                kwargs = {
+                    'timeout': self.timeout, 'verify': self.verify_tls,
+                    'headers': self._build_headers(referer=referer, xhr=method == 'POST'),
+                    'allow_redirects': False,
+                }
+                if method == 'POST':
+                    kwargs['data'] = data
+                response = getattr(self.session, method.lower())(url, **kwargs)
+                self._diagnose(stage, http_status=response.status_code,
+                               content_type=content_type_category(response), redirect_count=redirects)
+                if response.status_code in {403, 429}:
+                    self._diagnose('request_blocked', reason='access_restricted')
+                    raise RequestSafetyError(f'站点限制访问（HTTP {response.status_code}）；已停止，不切换域名重试')
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    return response
+                location = response.headers.get('Location')
+                if not location:
+                    raise RequestSafetyError('重定向缺少目标地址；已停止')
+                next_url = self._same_origin_url(location, base=url)
+                if method == 'POST' and response.status_code in {301, 302, 303}:
+                    method, data = 'GET', None
+                referer, url = url, next_url
+            raise RequestSafetyError('同源重定向次数超出上限；已停止')
         except request_exceptions.SSLError as exc:
-            raise RetryableError(f'TLS 证书验证失败：{exc}') from exc
+            raise RetryableError('TLS 证书验证失败；请检查站点证书，不要关闭证书校验') from exc
         except request_exceptions.Timeout as exc:
-            raise RetryableError(f'请求超时：{exc}') from exc
+            raise RetryableError('请求超时') from exc
         except request_exceptions.RequestException as exc:
-            raise RetryableError(f'网络请求失败：{exc}') from exc
+            raise RetryableError('网络请求失败；已省略可能包含验证 token 的请求地址') from exc
 
-    def _post(self, path: str, data: Dict[str, str], referer: str = ''):
-        url = path if path.startswith('http') else self.format_url(path)
-        try:
-            return self.session.post(
-                url,
-                data=data,
-                timeout=self.timeout,
-                verify=self.verify_tls,
-                headers=self._build_headers(referer=referer, xhr=True),
-            )
-        except request_exceptions.SSLError as exc:
-            raise RetryableError(f'TLS 证书验证失败：{exc}') from exc
-        except request_exceptions.Timeout as exc:
-            raise RetryableError(f'请求超时：{exc}') from exc
-        except request_exceptions.RequestException as exc:
-            raise RetryableError(f'网络请求失败：{exc}') from exc
+    def _get(self, path: str, referer: str = '', stage: str = 'request'):
+        return self._request('GET', path, referer=referer, stage=stage)
+
+    def _post(self, path: str, data: Dict[str, str], referer: str = '', stage: str = 'request'):
+        return self._request('POST', path, data=data, referer=referer, stage=stage)
 
     def _parse_attrs(self, raw_attrs: str) -> Dict[str, str]:
         attrs = {}
         for name, _, value in self.ATTR_RE.findall(raw_attrs):
-            attrs[name.lower()] = value
+            attrs[name.lower()] = unescape(value)
         return attrs
 
     def _extract_inputs(self, html: str) -> Dict[str, str]:
@@ -141,7 +189,7 @@ class Action:
         match = self.FORM_ACTION_RE.search(html)
         if not match:
             return fallback_url
-        action = match.group(2).strip()
+        action = unescape(match.group(2)).strip()
         if not action or action.lower().startswith('javascript:'):
             return fallback_url
         return urljoin(fallback_url, action)
@@ -150,14 +198,17 @@ class Action:
         match = self.ALTCHA_RE.search(html)
         if not match:
             return ''
-        return urljoin(self.format_url(''), match.group(2).strip())
+        return urljoin(self.format_url(''), unescape(match.group(2)).strip())
 
     def _hash_hex(self, algorithm: str, value: str) -> str:
         normalized = algorithm.lower().replace('-', '')
         return hashlib.new(normalized, value.encode('utf-8')).hexdigest()
 
     def _solve_altcha(self, challenge_url: str, referer: str) -> str:
-        challenge = self._get(challenge_url, referer=referer).json()
+        response = self._get(challenge_url, referer=referer, stage='altcha_get')
+        challenge = self._decode_json(response, 'ALTCHA')
+        if self.diagnostics:
+            self._diagnose('altcha_structure', **describe_challenge(challenge))
         algorithm = challenge.get('algorithm', 'SHA-256')
         salt = challenge['salt']
         expected = challenge['challenge']
@@ -181,21 +232,48 @@ class Action:
             'signature': signature,
         }
         encoded = json.dumps(payload, separators=(',', ':')).encode('utf-8')
-        return base64.b64encode(encoded).decode('ascii')
+        proof = base64.b64encode(encoded).decode('ascii')
+        if self.diagnostics:
+            self_check = self._altcha_self_check(challenge, proof)
+            self._diagnose('altcha_proof', self_check=self_check)
+            if not self_check:
+                raise VerificationError('ALTCHA 本地结构与摘要自检失败；未提交登录')
+        return proof
+
+    def _altcha_self_check(self, challenge: dict, proof: str) -> bool:
+        """Check serialization/hash consistency, not the server HMAC or expiry."""
+        try:
+            payload = json.loads(base64.b64decode(proof, validate=True))
+            number = payload['number']
+            return (
+                type(number) is int and 0 <= number <= int(challenge.get('maxnumber', 1000000))
+                and payload['algorithm'] == challenge.get('algorithm', 'SHA-256')
+                and all(payload[key] == challenge[key] for key in ('salt', 'challenge', 'signature'))
+                and self._hash_hex(payload['algorithm'], f'{payload["salt"]}{number}') == challenge['challenge']
+            )
+        except (ValueError, TypeError, KeyError, OverflowError):
+            return False
 
     def _decode_json(self, response, action_name: str) -> dict:
+        if response.status_code >= 400:
+            raise RetryableError(f'{action_name} 请求失败（HTTP {response.status_code}）')
         try:
-            return response.json()
+            result = response.json()
         except ValueError as exc:
-            snippet = re.sub(r'\s+', ' ', response.text or '')[:160]
             raise RetryableError(
-                f'{action_name} 未返回 JSON（HTTP {response.status_code}），可能是站点页面结构已变更或被风控拦截：{snippet}'
+                f'{action_name} 未返回 JSON（HTTP {response.status_code}）；'
+                '已省略响应正文，请检查站点页面结构或访问限制'
             ) from exc
+        if not isinstance(result, dict):
+            raise RetryableError(f'{action_name} 返回了非对象 JSON，无法确认操作结果')
+        return result
 
     def _current_code(self, method: str = '') -> str:
         chosen_method = (method or '').strip().lower()
         if chosen_method == 'email':
             return self.code
+        if chosen_method == 'ga' and not self.secret:
+            return ''
         if self.secret:
             if pyotp is None:
                 raise RuntimeError('缺少 pyotp 依赖，无法生成两步验证码')
@@ -207,11 +285,23 @@ class Action:
         form_data.update(overrides)
 
         altcha_url = self._extract_altcha_url(html)
+        action_url = self._same_origin_url(self._extract_form_action(html, fallback_url=page_response.url))
+        if altcha_url:
+            self._same_origin_url(altcha_url)
+        if self.diagnostics:
+            form_metadata = describe_form(html)
+            self._diagnose('login_form', csrf_present=bool(form_data.get('csrf_token')),
+                           challengeurl_detected=bool(altcha_url), **form_metadata)
+            if form_metadata['widget_count'] and not altcha_url:
+                self._diagnose('login_form_blocked', reason='unsupported_challenge')
+                raise VerificationError('诊断检测到无法识别的挑战接口；未提交登录')
+            if not form_metadata['form_count']:
+                self._diagnose('login_form_blocked', reason='unsupported_form')
+                raise VerificationError('诊断未识别到登录表单；未提交登录')
         if altcha_url:
             form_data['altcha'] = self._solve_altcha(altcha_url, referer=page_response.url)
 
-        action_url = self._extract_form_action(html, fallback_url=page_response.url)
-        response = self._post(action_url, form_data, referer=page_response.url)
+        response = self._post(action_url, form_data, referer=page_response.url, stage='login_post')
         return self._decode_json(response, '表单提交')
 
     def _needs_device_2fa(self, result: dict) -> bool:
@@ -262,6 +352,8 @@ class Action:
         return 'email'
 
     def _device_2fa(self, result: dict) -> dict:
+        if self.diagnostics:
+            raise RequestSafetyError('诊断模式不提交设备二次验证码')
         verify_url = result.get('redirect') or f'/auth/login/2fa?token={result.get("token", "")}'
         method = self._device_2fa_method(result, {})
         current_code = self._current_code(method)
@@ -301,6 +393,8 @@ class Action:
             'method': method,
             'trust_device': '1' if self.trust_device else '0',
         }
+        if 'csrf_token' in form_data:
+            payload['csrf_token'] = form_data['csrf_token']
 
         response = self._post('/auth/login/2fa/verify', payload, referer=page.url)
         return self._decode_json(response, '表单提交')
@@ -313,18 +407,37 @@ class Action:
         return response
 
     def login(self) -> dict:
-        login_page = self._get('auth/login')
+        login_page = self._get('auth/login', stage='login_get')
+        if login_page.status_code >= 400:
+            raise RetryableError(f'登录页面请求失败（HTTP {login_page.status_code}）')
         overrides = {
             'email': self.email,
             'passwd': self.passwd,
             'device_fingerprint': self.device_fingerprint,
         }
         result = self._submit_form(login_page, login_page.text, overrides=overrides)
+        outcome = 'accepted' if result.get('ret') == 1 else (
+            'device_2fa_required' if self._needs_device_2fa(result) else (
+                'verification_rejected' if '系统无法接受您的验证结果' in str(result.get('msg', '')) else 'rejected'
+            )
+        )
+        self._diagnose('login_result', outcome=outcome)
+        if self.diagnostics:
+            # Never expose a server message or reflected token to the runner.
+            return {'ret': 1 if outcome == 'accepted' else (2 if outcome == 'device_2fa_required' else 0),
+                    'diagnostic_outcome': outcome}
         if self._needs_device_2fa(result):
             return self._device_2fa(result)
+        if result.get('ret') != 1 and '系统无法接受您的验证结果' in str(result.get('msg', '')):
+            raise VerificationError(
+                '登录前验证未被站点接受，尚未进入设备二次验证；'
+                '需核对当前登录页面的验证流程，不能据此判断为缺少 TOTP'
+            )
         return result
 
     def check_in(self) -> dict:
+        if self.diagnostics:
+            raise RequestSafetyError('诊断模式不执行签到')
         user_page = self._get_user_page()
         form_data = self._extract_inputs(user_page.text)
         payload = {}
@@ -334,6 +447,8 @@ class Action:
         return self._decode_json(response, '签到')
 
     def info(self) -> Tuple:
+        if self.diagnostics:
+            raise RequestSafetyError('诊断模式不查询账号流量')
         html = self._get_user_page().text
         today_used = re.search(
             '<span class="traffic-info">今日已用</span>(.*?)<code class="card-tag tag-red">(.*?)</code>',
@@ -355,6 +470,8 @@ class Action:
         return ()
 
     def run(self):
-        self.login()
+        result = self.login()
+        if self.diagnostics:
+            return result
         self.check_in()
         self.info()

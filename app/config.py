@@ -15,6 +15,7 @@ DEFAULTS = {
     'telegram_bot_token': '',
     'telegram_chat_id': '',
     'device_fingerprint': '',
+    'diagnostics': 'false',
 }
 
 ROOT_DIR = Path(__file__).resolve().parent.parent

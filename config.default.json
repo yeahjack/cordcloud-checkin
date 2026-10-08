@@ -9,5 +9,6 @@
   "insecure_skip_verify": "false",
   "telegram_bot_token": "",
   "telegram_chat_id": "",
-  "device_fingerprint": ""
+  "device_fingerprint": "",
+  "diagnostics": "false"
 }

@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest import mock
 import uuid
 
-from app.action import Action
+import requests
+
+from app.action import Action, RetryableError, VerificationError
 from app.config import get_or_create_device_fingerprint, load_config
 from app.notify import NotifyError, TelegramNotifier
 
@@ -58,6 +60,26 @@ def build_challenge(number=7, salt='salt?expires=9999999999&', algorithm='SHA-25
 
 
 class ActionTests(unittest.TestCase):
+    def setUp(self):
+        # Every test is offline. Never invoke a live challenge solver or allow
+        # a real HTTP request, even if a regression forgets to inject a session.
+        self.http_guard = mock.patch(
+            'requests.sessions.Session.request',
+            side_effect=AssertionError('offline test: real HTTP is disabled'),
+        )
+        self.http_guard.start()
+        self.addCleanup(self.http_guard.stop)
+        self.fake_altcha = base64.b64encode(json.dumps({
+            'algorithm': 'SHA-256',
+            'challenge': build_challenge()['challenge'],
+            'number': 7,
+            'salt': 'salt?expires=9999999999&',
+            'signature': 'signed',
+        }).encode('utf-8')).decode('ascii')
+        self.solver = mock.patch.object(Action, '_solve_altcha', return_value=self.fake_altcha)
+        self.solver_mock = self.solver.start()
+        self.addCleanup(self.solver.stop)
+
     def test_load_config_merges_default_and_local_files(self):
         tmp = Path('.test-config-tmp') / str(uuid.uuid4())
         tmp.mkdir(parents=True, exist_ok=True)
@@ -313,6 +335,97 @@ class ActionTests(unittest.TestCase):
         form_data = post_kwargs['data']
         self.assertEqual(form_data['method'], 'email')
         self.assertEqual(form_data['code'], '654321')
+        self.assertEqual(form_data['csrf_token'], 'csrf-2')
+
+    def test_html_attributes_decode_entities_like_the_browser(self):
+        action = Action('user@example.com', 'passwd')
+        fields = action._extract_inputs(
+            '<input type="hidden" name="csrf_token" value="token&amp;&quot;&#39;">'
+        )
+        self.assertEqual(fields['csrf_token'], 'token&"\'')
+        self.assertEqual(action._extract_altcha_url(
+            '<altcha-widget challengeurl="/auth/altcha/challenge?a=1&amp;b=2">'
+        ), 'https://cordcloud.us/auth/altcha/challenge?a=1&b=2')
+        self.assertEqual(action._extract_form_action(
+            '<form action="/auth/login?a=1&amp;b=2">',
+            'https://cordcloud.us/auth/login',
+        ), 'https://cordcloud.us/auth/login?a=1&b=2')
+
+    def test_login_verification_rejection_is_not_device_2fa(self):
+        action = Action('user@example.com', 'passwd', verify_method='ga')
+        page = FakeResponse('https://cordcloud.us/auth/login')
+        rejection = {'ret': 0, 'msg': '系统无法接受您的验证结果，请刷新页面后重试'}
+        with mock.patch.object(action, '_get', return_value=page), \
+                mock.patch.object(action, '_submit_form', return_value=rejection), \
+                mock.patch.object(action, '_device_2fa') as device_2fa:
+            with self.assertRaisesRegex(VerificationError, '尚未进入设备二次验证'):
+                action.login()
+        device_2fa.assert_not_called()
+
+    def test_ga_without_secret_does_not_reuse_email_code(self):
+        action = Action('user@example.com', 'passwd', code='123456')
+        self.assertEqual(action._current_code('ga'), '')
+        self.assertEqual(action._current_code('email'), '123456')
+
+    def test_auto_email_2fa_without_code_stops_without_submitting(self):
+        session = FakeSession({})
+        action = Action('user@example.com', 'passwd', verify_method='auto', session=session)
+        result = action._device_2fa({
+            'ret': 2, 'need_device_2fa': True, 'methods': {'email': True},
+            'token': 'synthetic-token', 'redirect': '/auth/login/2fa?token=synthetic-token',
+        })
+        self.assertEqual(result['ret'], 0)
+        self.assertIn('code', result['msg'])
+        self.assertEqual(session.calls, [])
+
+    def test_non_json_response_does_not_log_page_or_token(self):
+        action = Action('user@example.com', 'passwd')
+        response = FakeResponse('https://cordcloud.us/auth/login', text='private-token-123')
+        with self.assertRaises(RetryableError) as raised:
+            action._decode_json(response, '登录')
+        self.assertNotIn('private-token-123', str(raised.exception))
+        self.assertIn('HTTP 200', str(raised.exception))
+
+    def test_json_array_cannot_count_as_api_success(self):
+        action = Action('user@example.com', 'passwd')
+        response = FakeResponse('https://cordcloud.us/auth/login', json_data=[{'ret': 1}])
+        with self.assertRaisesRegex(RetryableError, '非对象 JSON'):
+            action._decode_json(response, '登录')
+
+    def test_http_error_cannot_count_as_api_success(self):
+        action = Action('user@example.com', 'passwd')
+        response = FakeResponse(
+            'https://cordcloud.us/auth/login', json_data={'ret': 1}, status_code=403,
+        )
+        with self.assertRaisesRegex(RetryableError, 'HTTP 403'):
+            action._decode_json(response, '登录')
+
+    def test_network_exceptions_do_not_log_tokenized_url(self):
+        for method in ('get', 'post'):
+            with self.subTest(method=method):
+                session = mock.Mock()
+                getattr(session, method).side_effect = requests.RequestException(
+                    'failed https://cordcloud.us/auth/login/2fa?token=private-token-123'
+                )
+                action = Action('user@example.com', 'passwd', session=session)
+                with self.assertRaises(RetryableError) as raised:
+                    if method == 'get':
+                        action._get('/auth/login/2fa?token=private-token-123')
+                    else:
+                        action._post('/auth/login/2fa/verify', {})
+                self.assertNotIn('private-token-123', str(raised.exception))
+
+    def test_login_does_not_fetch_a_real_challenge(self):
+        # The ordinary login regression must use only the canned proof fixture.
+        action = Action('user@example.com', 'passwd')
+        page = FakeResponse('https://cordcloud.us/auth/login')
+        html = '<altcha-widget challengeurl="/auth/altcha/challenge"></altcha-widget>'
+        with mock.patch.object(action, '_post', return_value=FakeResponse(
+            page.url, json_data={'ret': 1},
+        )) as post:
+            action._submit_form(page, html, {})
+        self.solver_mock.assert_called_once()
+        self.assertEqual(post.call_args.args[1]['altcha'], self.fake_altcha)
 
     def test_telegram_notifier_sends_message(self):
         notifier = TelegramNotifier(bot_token='bot-token', chat_id='123456')
@@ -335,6 +448,30 @@ class ActionTests(unittest.TestCase):
         with mock.patch('app.notify.requests.post', return_value=response):
             with self.assertRaises(NotifyError):
                 notifier.send('签到失败')
+
+    def test_telegram_exception_does_not_log_bot_token(self):
+        notifier = TelegramNotifier(bot_token='private-bot-token', chat_id='123456')
+        with mock.patch('app.notify.requests.post', side_effect=requests.RequestException(
+            'failed https://api.telegram.org/botprivate-bot-token/sendMessage'
+        )):
+            with self.assertRaises(NotifyError) as raised:
+                notifier.send('test')
+        self.assertNotIn('private-bot-token', str(raised.exception))
+
+    def test_telegram_non_json_does_not_log_response(self):
+        notifier = TelegramNotifier(bot_token='private-bot-token', chat_id='123456')
+        response = FakeResponse('https://api.telegram.org', text='private-response-data')
+        with mock.patch('app.notify.requests.post', return_value=response):
+            with self.assertRaises(NotifyError) as raised:
+                notifier.send('test')
+        self.assertNotIn('private-response-data', str(raised.exception))
+
+    def test_telegram_rejects_non_object_json(self):
+        notifier = TelegramNotifier(bot_token='private-bot-token', chat_id='123456')
+        response = FakeResponse('https://api.telegram.org', json_data=[])
+        with mock.patch('app.notify.requests.post', return_value=response):
+            with self.assertRaisesRegex(NotifyError, '非对象 JSON'):
+                notifier.send('test')
 
     def test_check_in_uses_user_csrf_token(self):
         user_html = '''
