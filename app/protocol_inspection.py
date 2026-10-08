@@ -4,6 +4,7 @@ Output is built from fixed vocabulary and punctuation. All other identifiers
 are anonymized, numbers are replaced, and non-protocol string values vanish.
 """
 import re
+from posixpath import basename
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -24,7 +25,8 @@ form submit login loading disabled html hide show on click val serialize seriali
 length map filter find includes startsWith toString toLowerCase charCodeAt encodeURIComponent
 decodeURIComponent setTimeout clearTimeout console log warn error location href protocol hostname
 sessionStorage localStorage getItem setItem removeItem Altcha ALTCHA altcha2 pow hmac hash hashes checksum
-maxNumber base64 workload complexity pbkdf2 PBKDF2 argon2 argon2id scrypt counter'''.split())
+maxNumber base64 workload complexity pbkdf2 PBKDF2 argon2 argon2id scrypt counter eval unescape
+String fromCharCode charCodeAt'''.split())
 LITERALS = frozenset('''GET POST application/json application/x-www-form-urlencoded
 SHA-256 SHA-384 SHA-512 sha256 sha384 sha512 email Email passwd Password csrf_token
 device_fingerprint remember_me altcha altcha_response algorithm challenge challengeurl challengejson
@@ -51,7 +53,7 @@ def _literal(raw):
                   lambda m: chr(int(m.group(1) or m.group(2), 16)), value)
 
 
-def protocol_windows(source):
+def protocol_windows(source, include_all=False):
     aliases, rendered, anchors = {}, [], []
     for match in TOKEN.finditer(source):
         kind, raw = match.lastgroup, match.group()
@@ -59,7 +61,7 @@ def protocol_windows(source):
             continue
         if kind == 'string':
             value = _literal(raw)
-            if 'altcha' in value.lower() or value == '/auth/login':
+            if 'altcha' in value.lower() or value in {'/auth/login', 'auth/login', 'login', 'passwd', 'csrf_token'}:
                 anchors.append(len(rendered))
             path = urlparse(value).path if value.startswith('/auth/') else ''
             if path in PATHS:
@@ -67,7 +69,7 @@ def protocol_windows(source):
             else:
                 token = repr(value) if value in LITERALS | PATHS | SELECTORS else "'<string>'"
         elif kind == 'word':
-            if 'altcha' in raw.lower() or raw in {'solveChallenge', 'createChallenge'}:
+            if 'altcha' in raw.lower() or raw in {'solveChallenge', 'createChallenge', 'passwd', 'csrf_token', 'ajax', 'fetch'}:
                 anchors.append(len(rendered))
             if raw in WORDS:
                 token = raw
@@ -78,6 +80,8 @@ def protocol_windows(source):
         else:
             token = raw if raw in '{}[]().,;:=+-*/!<>?&|%^~' else '<symbol>'
         rendered.append(token)
+    if include_all and rendered:
+        return [' '.join(rendered[:8000])]
     windows, covered = [], -1
     for index in anchors:
         if index <= covered:
@@ -133,3 +137,29 @@ def script_sources(html, base):
         except ValueError:
             continue
     return parser.inline, sources[:6]
+
+
+def public_script_hints(html, base):
+    """Public host/static basename only: never full paths, query or userinfo."""
+    parser = ScriptSources()
+    parser.feed(html)
+    origin = urlparse(base)
+    hints = []
+    for raw in parser.sources:
+        try:
+            url = urlparse(urljoin(base, raw))
+            if url.scheme != 'https' or not url.hostname or url.username or url.password:
+                continue
+            filename = basename(url.path)
+            safe_filename = filename if re.fullmatch(r'[A-Za-z][A-Za-z_.-]{0,38}\.js', filename) else '<redacted-basename>'
+            version = re.search(r'(?i)altcha[@/][~^v]?(\d{1,2}\.\d{1,3}\.\d{1,3})(?:/|$)', url.path)
+            hints.append({
+                'hostname': url.hostname,
+                'basename': safe_filename,
+                'same_origin': url.hostname == origin.hostname and (url.port or 443) == (origin.port or 443),
+                'altcha_reference': 'altcha' in url.path.lower(),
+                'altcha_package_version': version.group(1) if version else 'unknown',
+            })
+        except ValueError:
+            continue
+    return hints[:20]

@@ -428,6 +428,15 @@ class StaticProtocolTests(unittest.TestCase):
         self.assertNotIn('999999', output)
         self.assertIn('altcha', output)
 
+    def test_full_inline_structure_includes_calls_without_provider_name(self):
+        from app.protocol_inspection import protocol_windows
+        source = "const privateHandler = () => $.ajax({data: {passwd: 'private-password'}}); eval('private-source');"
+        output = ' '.join(protocol_windows(source, include_all=True))
+        self.assertIn('ajax', output)
+        self.assertIn('passwd', output)
+        self.assertIn('eval', output)
+        self.assertNotIn('private', output)
+
     def test_only_observed_same_origin_js_are_selected_and_queries_removed(self):
         from app.protocol_inspection import script_sources
         html = '''<script>window.altcha;</script><script src="/assets/login.js?token=private-token"></script>
@@ -442,6 +451,17 @@ class StaticProtocolTests(unittest.TestCase):
         html = ''.join(f'<script src="/assets/file{i}.js"></script>' for i in range(20))
         _, urls = script_sources(html, 'https://cordcloud.one/auth/login')
         self.assertEqual(len(urls), 6)
+
+    def test_public_script_hints_omit_paths_queries_and_opaque_basenames(self):
+        from app.protocol_inspection import public_script_hints
+        html = '''<script src="https://cdn.example.net/private-path/altcha@2.1.4/dist/altcha.min.js?token=private-token"></script>
+        <script src="/assets/private123456789.js?secret=private-query"></script>'''
+        hints = public_script_hints(html, 'https://cordcloud.one/auth/login')
+        self.assertEqual(hints[0]['hostname'], 'cdn.example.net')
+        self.assertEqual(hints[0]['basename'], 'altcha.min.js')
+        self.assertEqual(hints[0]['altcha_package_version'], '2.1.4')
+        self.assertEqual(hints[1]['basename'], '<redacted-basename>')
+        self.assertNotIn('private', json.dumps(hints))
 
     def test_opt_in_reads_static_js_without_post_or_challenge_requests(self):
         url, js_url = 'https://cordcloud.one/auth/login', 'https://cordcloud.one/assets/login.js'

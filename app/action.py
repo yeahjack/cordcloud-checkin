@@ -8,7 +8,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from app.diagnostics import content_type_category, describe_challenge, describe_form, describe_page, emit
-from app.protocol_inspection import protocol_windows, script_sources
+from app.protocol_inspection import protocol_windows, public_script_hints, script_sources
 
 import requests
 from requests import exceptions as request_exceptions
@@ -474,9 +474,13 @@ class Action:
         metadata = describe_page(page.text, page.url)
         self._diagnose('page_structure', **metadata)
         if self.inspect_scripts:
+            self._diagnose('public_script_hints', sources=public_script_hints(page.text, page.url))
             inline, sources = script_sources(page.text, page.url)
+            self._diagnose('protocol_sources', inline_blocks=len(inline),
+                           nonempty_inline_blocks=sum(bool(source.strip()) for source in inline),
+                           eligible_static_scripts=len(sources))
             for index, source in enumerate(inline):
-                windows = protocol_windows(source)
+                windows = protocol_windows(source, include_all=True)
                 if windows:
                     self._diagnose('protocol_inline', source_index=index, normalized_windows=windows)
             for index, url in enumerate(sources):
@@ -485,7 +489,7 @@ class Action:
                     self.session.cookies.clear()
                 script = self._get(url, stage='static_js_get')
                 content_type = script.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
-                if (script.status_code != 200 or len(script.text) > 200000 or content_type not in
+                if (script.status_code != 200 or len(script.text) > 2000000 or content_type not in
                         {'', 'text/plain', 'text/javascript', 'application/javascript', 'application/x-javascript'}):
                     self._diagnose('static_js_skipped', source_index=index, reason='status_size_or_type')
                     continue
