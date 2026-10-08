@@ -8,7 +8,7 @@ from unittest import mock
 
 import app
 from app.action import Action, RequestSafetyError
-from app.diagnostics import describe_challenge, describe_form
+from app.diagnostics import describe_challenge, describe_form, describe_page
 from test import FakeResponse, FakeSession, build_challenge
 
 
@@ -264,6 +264,140 @@ class DiagnosticTests(unittest.TestCase):
         constructor.assert_not_called()
         action.login.assert_not_called()
         log.set_failed.assert_called_once()
+
+
+class PageOnlyTests(unittest.TestCase):
+    def setUp(self):
+        self.logs = []
+        self.http_guard = mock.patch('requests.sessions.Session.request', side_effect=AssertionError('real HTTP forbidden'))
+        self.http_guard.start()
+        self.addCleanup(self.http_guard.stop)
+
+    def action(self, responses=None, **kwargs):
+        return Action('', '', host='cordcloud.one', page_only=True, session=FakeSession(responses or {}),
+                      diagnostic_logger=self.logs.append, **kwargs)
+
+    def test_page_summary_only_emits_fixed_categories(self):
+        html = '''<form id="login-form" action="javascript:void(0)">
+        <input name="Email" value="private-email"><input name="Password" value="private-password">
+        <input name="csrf_token" value="private-csrf"><input name="private-unknown-name" value="private-value">
+        </form><script src="/assets/login.js?token=private-query"></script>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?secret=private-query"></script>
+        <script src="https://static.geetest.com/gt.js?token=private-query"></script>
+        <script src="https://cdn.jsdelivr.net/npm/altcha/dist/altcha.js"></script>
+        <script src="https://private-host.invalid/private-path"></script>
+        <script>window.grecaptcha; const hidden='private-inline';</script>'''
+        record = describe_page(html, 'https://cordcloud.one/auth/login')
+        self.assertEqual(record['provider_markers'], ['altcha', 'geetest', 'recaptcha', 'turnstile'])
+        self.assertEqual(record['form_action_categories'], {'scripted': 1})
+        self.assertEqual(record['known_fields'], ['Email', 'Password', 'csrf_token'])
+        self.assertEqual(record['script_source_categories'], {
+            'same_origin': 1, 'cloudflare_challenge_cdn': 1, 'geetest_cdn': 1,
+            'public_package_cdn': 1, 'other_external': 1, 'inline': 1,
+        })
+        self.assertNotIn('private-', json.dumps(record))
+
+    def test_form_action_category_does_not_include_query_or_unknown_path(self):
+        html = '''<form action="/auth/login?token=private-query"></form>
+        <form action="/private-path"></form><form action="https://private-host.invalid/"></form>'''
+        record = describe_page(html, 'https://cordcloud.one/auth/login')
+        self.assertEqual(record['form_action_categories'], {'cross_origin': 1, 'login': 1, 'same_origin_other': 1})
+        self.assertNotIn('private-', json.dumps(record))
+
+    def test_page_mode_makes_only_one_get_and_no_script_requests(self):
+        url = 'https://cordcloud.one/auth/login'
+        action = self.action({('GET', url): [FakeResponse(url, text='<script src="/captcha.js"></script><form></form>')]})
+        with mock.patch.object(action, '_solve_altcha') as solver:
+            record = action.inspect_login_page()
+        solver.assert_not_called()
+        self.assertEqual(len(action.session.calls), 1)
+        method, target, kwargs = action.session.calls[0]
+        self.assertEqual((method, target), ('GET', url))
+        self.assertNotIn('data', kwargs)
+        self.assertFalse(kwargs['allow_redirects'])
+        self.assertTrue(kwargs['verify'])
+        self.assertEqual(record['script_source_categories'], {'same_origin': 1})
+        self.assertEqual(action.device_fingerprint, '')
+
+    def test_page_mode_rejects_credentials(self):
+        for kwargs in ({'email': 'private-email'}, {'passwd': 'private-password'},
+                       {'secret': 'private-secret'}, {'code': 'private-otp'}):
+            values = {'email': '', 'passwd': '', **kwargs}
+            with self.assertRaises(RequestSafetyError):
+                Action(**values, host='cordcloud.one', page_only=True)
+
+    def test_page_mode_clears_inherited_auth_and_disables_environment_auth(self):
+        import requests
+        session = requests.Session()
+        session.headers['Authorization'] = 'private-auth'
+        session.headers['Cookie'] = 'private-cookie'
+        session.auth = ('private-user', 'private-password')
+        session.cookies.set('session', 'private-value')
+        Action('', '', host='cordcloud.one', page_only=True, session=session)
+        self.assertIsNone(session.auth)
+        self.assertFalse(session.trust_env)
+        self.assertNotIn('Authorization', session.headers)
+        self.assertNotIn('Cookie', session.headers)
+        self.assertFalse(session.cookies)
+
+    def test_page_mode_blocks_login_solver_post_and_other_get_paths(self):
+        action = self.action()
+        operations = [lambda: action.login(), lambda: action._solve_altcha('/challenge', ''),
+                      lambda: action._post('/auth/login', {}), lambda: action._get('/auth/altcha/challenge'),
+                      lambda: action._get('/auth/login?token=private-token'), lambda: action.check_in()]
+        for operation in operations:
+            with self.assertRaises(RequestSafetyError):
+                operation()
+        self.assertEqual(action.session.calls, [])
+
+    def test_page_mode_does_not_follow_even_same_origin_redirect(self):
+        url = 'https://cordcloud.one/auth/login'
+        action = self.action({('GET', url): [FakeResponse(url, status_code=302, headers={'Location': '/auth/login?private=token'})]})
+        with self.assertRaises(RequestSafetyError):
+            action.inspect_login_page()
+        self.assertEqual(len(action.session.calls), 1)
+        self.assertNotIn('private', '\n'.join(self.logs))
+
+    def test_page_mode_rejects_disabled_tls(self):
+        action = self.action(verify_tls=False)
+        with self.assertRaises(RequestSafetyError):
+            action.inspect_login_page()
+        self.assertEqual(action.session.calls, [])
+
+    def test_page_mode_entrypoint_never_reads_account_or_config(self):
+        core, log = mock.Mock(), mock.Mock()
+        def get_input(name):
+            if name not in {'page_only', 'host'}:
+                raise AssertionError('account or other input must not be read')
+            return {'page_only': 'true', 'host': 'cordcloud.one'}[name]
+        core.get_input.side_effect = get_input
+        toolkit = types.ModuleType('actions_toolkit')
+        toolkit.core = core
+        action = mock.Mock()
+        with mock.patch.dict('sys.modules', {'actions_toolkit': toolkit, 'app.log': log}), \
+             mock.patch.object(app, 'log', log, create=True), \
+             mock.patch('app.action.Action', return_value=action) as constructor, \
+             mock.patch('app.config.load_config') as config, \
+             mock.patch('app.notify.TelegramNotifier') as notifier:
+            with self.assertRaises(SystemExit) as exit_code:
+                runpy.run_path('main.py', run_name='__main__')
+        self.assertEqual(exit_code.exception.code, 0)
+        config.assert_not_called()
+        notifier.assert_not_called()
+        constructor.assert_called_once_with('', '', host='cordcloud.one', page_only=True, diagnostic_logger=log.info)
+        action.inspect_login_page.assert_called_once()
+        action.login.assert_not_called()
+        action.check_in.assert_not_called()
+        core.set_secret.assert_not_called()
+
+    def test_page_workflow_step_contains_no_secret_reference(self):
+        from pathlib import Path
+        workflow = Path('.github/workflows/cordcloud.yml').read_text()
+        page_step = workflow.split('- name: Read login page structure without credentials', 1)[1].split('- name:', 1)[0]
+        self.assertNotIn('secrets.', page_step)
+        for credential in ('email:', 'passwd:', 'secret:', 'code:', 'telegram_'):
+            self.assertNotIn(credential, page_step)
+        self.assertIn('page_only: true', page_step)
 
 
 if __name__ == '__main__':

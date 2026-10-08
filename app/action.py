@@ -7,7 +7,7 @@ from html import unescape
 from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
 
-from app.diagnostics import content_type_category, describe_challenge, describe_form, emit
+from app.diagnostics import content_type_category, describe_challenge, describe_form, describe_page, emit
 
 import requests
 from requests import exceptions as request_exceptions
@@ -58,7 +58,10 @@ class Action:
         device_fingerprint: str = '',
         diagnostics: bool = False,
         diagnostic_logger=None,
+        page_only: bool = False,
     ):
+        if page_only and any((email, passwd, secret, code)):
+            raise RequestSafetyError('只读页面诊断不接受账号或凭据')
         self.email = email
         self.passwd = passwd
         self.secret = secret
@@ -66,11 +69,21 @@ class Action:
         self.verify_method = verify_method.strip().lower()
         self.host = host.replace('https://', '').replace('http://', '').strip().rstrip('/')
         self.session = session or requests.session()
+        if page_only:
+            # A pure page probe must not inherit netrc credentials, proxy
+            # configuration, Authorization headers or an authenticated jar.
+            self.session.trust_env = False
+            self.session.auth = None
+            self.session.headers.pop('Authorization', None)
+            self.session.headers.pop('Cookie', None)
+            if hasattr(self.session, 'cookies'):
+                self.session.cookies.clear()
         self.timeout = 15
         self.trust_device = trust_device
         self.verify_tls = verify_tls
-        self.device_fingerprint = device_fingerprint or self._build_device_fingerprint()
-        self.diagnostics = diagnostics
+        self.device_fingerprint = '' if page_only else (device_fingerprint or self._build_device_fingerprint())
+        self.diagnostics = diagnostics or page_only
+        self.page_only = page_only
         self.diagnostic_logger = diagnostic_logger or print
         self.session.headers.update({
             'User-Agent': (
@@ -124,6 +137,12 @@ class Action:
 
     def _request(self, method: str, path: str, data=None, referer: str = '', stage: str = 'request'):
         url = self._same_origin_url(path)
+        if self.page_only:
+            target = urlparse(url)
+            if method != 'GET' or target.path != '/auth/login' or target.query or data:
+                raise RequestSafetyError('只读页面诊断仅允许 GET /auth/login，不携带请求数据')
+            if not self.verify_tls:
+                raise RequestSafetyError('只读页面诊断必须保持 TLS 校验')
         if referer:
             self._same_origin_url(referer)
         try:
@@ -145,6 +164,9 @@ class Action:
                     raise RequestSafetyError(f'站点限制访问（HTTP {response.status_code}）；已停止，不切换域名重试')
                 if response.status_code not in {301, 302, 303, 307, 308}:
                     return response
+                if self.page_only:
+                    self._diagnose('page_only_blocked', reason='redirect')
+                    raise RequestSafetyError('只读页面诊断不跟随重定向')
                 location = response.headers.get('Location')
                 if not location:
                     raise RequestSafetyError('重定向缺少目标地址；已停止')
@@ -205,6 +227,8 @@ class Action:
         return hashlib.new(normalized, value.encode('utf-8')).hexdigest()
 
     def _solve_altcha(self, challenge_url: str, referer: str) -> str:
+        if self.page_only:
+            raise RequestSafetyError('只读页面诊断不获取或求解验证挑战')
         response = self._get(challenge_url, referer=referer, stage='altcha_get')
         challenge = self._decode_json(response, 'ALTCHA')
         if self.diagnostics:
@@ -407,6 +431,8 @@ class Action:
         return response
 
     def login(self) -> dict:
+        if self.page_only:
+            raise RequestSafetyError('只读页面诊断不执行登录')
         login_page = self._get('auth/login', stage='login_get')
         if login_page.status_code >= 400:
             raise RetryableError(f'登录页面请求失败（HTTP {login_page.status_code}）')
@@ -434,6 +460,16 @@ class Action:
                 '需核对当前登录页面的验证流程，不能据此判断为缺少 TOTP'
             )
         return result
+
+    def inspect_login_page(self) -> dict:
+        if not self.page_only:
+            raise RequestSafetyError('页面结构探查需要明确开启只读模式')
+        page = self._get('/auth/login', stage='page_get')
+        if page.status_code >= 400:
+            raise RetryableError(f'页面请求失败（HTTP {page.status_code}）')
+        metadata = describe_page(page.text, page.url)
+        self._diagnose('page_structure', **metadata)
+        return metadata
 
     def check_in(self) -> dict:
         if self.diagnostics:
@@ -470,6 +506,8 @@ class Action:
         return ()
 
     def run(self):
+        if self.page_only:
+            return self.inspect_login_page()
         result = self.login()
         if self.diagnostics:
             return result

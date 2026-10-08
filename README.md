@@ -472,6 +472,17 @@ gh workflow run cordcloud.yml --repo yeahjack/cordcloud-checkin --ref fix/login-
 触发后核对 run 的 branch、head SHA 和输入为 `diagnostics=true`。不要修改默认分支来启用实验，也不要提供新凭据到聊天或命令行。
 诊断运行显示完成，仅代表此次诊断完成，不代表已经签到。
 
+### 不使用账号的只读页面探查
+
+手动运行现有 workflow 时可选择 `page_only=true`（默认关闭）。这个独立 step 只接收 host 和 page_only，不传入任何仓库账号 Secrets。
+程序在读取配置和账号参数前进入只读分支，只 GET 一次 `/auth/login`；不跟随重定向、不加载页面脚本、不 POST、不登录、不获取或求解验证码，也不保存 Cookie。
+仅输出固定验证码品牌的文本标记、脚本来源类别、表单动作类别和白名单字段名；不输出 HTML、脚本正文、URL/query 或字段值。
+这些标记只能帮助识别候选协议，不能证明对应验证组件正在生效。`Email`/`Password` 与 API 的 `email`/`passwd` 大小写不同，也可能是网页 JavaScript 的正常映射，不能据此直接判定根因。
+
+```bash
+gh workflow run cordcloud.yml --repo yeahjack/cordcloud-checkin --ref fix/login-protocol-safety -f page_only=true -f diagnostics=false
+```
+
 ## 声明
 
 请不要把真实账号、密码、`secret`、邮件验证码直接提交到仓库。

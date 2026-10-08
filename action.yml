@@ -6,11 +6,11 @@ branding:
   color: "gray-dark"
 inputs:
   email:
-    description: "your cordcloud email"
-    required: true
+    description: "your cordcloud email (required except in page_only mode)"
+    required: false
   passwd:
-    description: "your cordcloud password"
-    required: true
+    description: "your cordcloud password (required except in page_only mode)"
+    required: false
   secret:
     description: "your TOTP secret for authenticator-based 2FA"
     required: false
@@ -22,6 +22,10 @@ inputs:
     required: false
   diagnostics:
     description: "value-free, single-host login diagnostics only; no 2FA/check-in/notifications"
+    required: false
+    default: "false"
+  page_only:
+    description: "credential-free GET of the login page; no redirects, login or challenge solving"
     required: false
     default: "false"
   trust_device:

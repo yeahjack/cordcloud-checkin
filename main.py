@@ -76,6 +76,25 @@ def safe_notify(notifier: TelegramNotifier | None, message: str):
         log.warning(f'Telegram 推送失败，错误信息：{exc}')
 
 
+def maybe_run_page_only():
+    # Early exit before reading configuration, account inputs or notification
+    # inputs. The dedicated workflow step supplies only this flag and one host.
+    if (core.get_input('page_only') or '').strip().lower() != 'true':
+        return
+    try:
+        host = (core.get_input('host') or '').strip()
+        if not host or ',' in host:
+            raise RuntimeError('需要一个明确的 host')
+        Action('', '', host=host, page_only=True, diagnostic_logger=log.info).inspect_login_page()
+        log.info('只读页面诊断已结束；未发送账号、登录表单、验证码或通知')
+    except Exception:
+        log.set_failed('只读页面诊断已停止；请查看固定阶段记录，未输出原始错误内容')
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+
+maybe_run_page_only()
+
 notifier = None
 last_host = ''
 diagnostic_mode = False

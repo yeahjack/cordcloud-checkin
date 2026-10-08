@@ -10,6 +10,11 @@ on:
         type: boolean
         required: false
         default: false
+      page_only:
+        description: "Read-only login page structure (no credentials or POST)"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   checkin:
@@ -24,7 +29,17 @@ jobs:
           sleep "$delay"
 
       - uses: actions/checkout@v4
-      - uses: ./
+        with:
+          persist-credentials: false
+      - name: Read login page structure without credentials
+        if: github.event_name == 'workflow_dispatch' && inputs.page_only
+        uses: ./
+        with:
+          page_only: true
+          host: cordcloud.one
+      - name: Run check-in or login diagnostics
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.page_only) }}
+        uses: ./
         with:
           diagnostics: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostics || false }}
           email: ${{ secrets.CC_EMAIL }}
